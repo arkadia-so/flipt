@@ -1,0 +1,289 @@
+name: Bench S9
+# outrun spike S9 (ARK-56, ARK-62 27956a8b, ARK-81): Flipt's two Dagger jobs against the same work as
+# plain GitHub Actions steps, on outrun's Linux VMs (outrun-linux-arm64, ARM64), all in one run.
+# Source of truth: arkadia outrun/spikes/s9-dagger/ (README.md there). Four arms per job:
+#   dagger       upstream's step (`dagger call ...`), engine cold (a fresh VM per job, as upstream).
+#   dagger-warm  the same, the engine's state (/var/lib/dagger) restored from outrun's cache and saved
+#                after: the closest a fresh VM gets to a persistent engine.
+#   gha          the same work as plain steps (layer 1): toolchains and their caches (Go, npm) through
+#                actions/cache on outrun's cache, services through Docker.
+#   gha-engine   gha plus outrun's engine: the job is a command unit of outrun.json, looked up after
+#                checkout; every later step runs only on a miss.
+# Every cache is keyed by the `cache` input, so a new namespace starts cold for every arm.
+# Docker Hub images come through mirror.gcr.io (one public IP for the whole fleet).
+
+on:
+  workflow_dispatch:
+    inputs:
+      cache:
+        description: cache namespace (outrun's engine and every actions/cache key)
+        required: false
+        default: outrun
+
+permissions:
+  contents: read
+  id-token: write # outrun's cache
+
+env:
+  DAGGER_VERSION: 0.21.9
+  OUTRUN_CACHE_URL: https://turbo-cache.arkadia.so
+  OUTRUN_CACHE_TEAM: ${{ inputs.cache || 'outrun' }}
+  NS: ${{ inputs.cache || 'outrun' }}
+
+jobs:
+  # ---- Tests (Go): upstream test.yml `dagger call test --source . unit` ----
+  unit-dagger:
+    name: Tests (Go) dagger
+    runs-on: outrun-linux-arm64
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - name: Start the Dagger engine
+        run: &engine |
+          printf '[registry."docker.io"]\n  mirrors = ["mirror.gcr.io"]\n' > "$RUNNER_TEMP/engine.toml"
+          sudo mkdir -p /var/lib/dagger-s9
+          docker run -d --name dagger-engine --privileged -v /var/lib/dagger-s9:/var/lib/dagger \
+            -v "$RUNNER_TEMP/engine.toml:/etc/dagger/engine.toml:ro" "registry.dagger.io/engine:v$DAGGER_VERSION"
+          echo "_EXPERIMENTAL_DAGGER_RUNNER_HOST=docker-container://dagger-engine" >> "$GITHUB_ENV"
+      - name: Run Unit Tests
+        uses: dagger/dagger-for-github@v7
+        with:
+          verb: call
+          version: ${{ env.DAGGER_VERSION }}
+          args: test --source . unit export --path coverage.txt
+
+  unit-dagger-warm:
+    name: Tests (Go) dagger-warm
+    runs-on: outrun-linux-arm64
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - name: Restore the engine's state
+        id: state
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/dagger-state.tzst
+          key: dagger-unit-${{ env.NS }}-${{ github.run_id }}
+          restore-keys: dagger-unit-${{ env.NS }}-
+      - name: Unpack the engine's state
+        if: steps.state.outputs.cache-matched-key != ''
+        run: &unpack |
+          sudo mkdir -p /var/lib/dagger-s9
+          zstd -dc "$RUNNER_TEMP/dagger-state.tzst" | sudo tar -C /var/lib/dagger-s9 -xf -
+          rm "$RUNNER_TEMP/dagger-state.tzst"; sudo du -sh /var/lib/dagger-s9
+      - name: Start the Dagger engine
+        run: *engine
+      - name: Run Unit Tests
+        uses: dagger/dagger-for-github@v7
+        with:
+          verb: call
+          version: ${{ env.DAGGER_VERSION }}
+          args: test --source . unit export --path coverage.txt
+      - name: Pack the engine's state
+        run: &pack |
+          docker stop -t 30 dagger-engine
+          sudo tar -C /var/lib/dagger-s9 -cf - . | zstd -T0 -3 -q -o "$RUNNER_TEMP/dagger-state.tzst"
+          ls -l "$RUNNER_TEMP/dagger-state.tzst"
+      - name: Save the engine's state
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/dagger-state.tzst
+          key: dagger-unit-${{ env.NS }}-${{ github.run_id }}
+
+  unit-gha:
+    name: Tests (Go) gha
+    runs-on: outrun-linux-arm64
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-unit-${{ env.NS }}-${{ github.run_id }}
+          restore-keys: go-unit-${{ env.NS }}-
+      - name: Services (Redis, Gitea)
+        run: &services |
+          docker run -d --name redis -p 6379:6379 mirror.gcr.io/library/redis:alpine
+          docker run -d --name gitea -p 3000:3000 mirror.gcr.io/gitea/gitea:1.21.1 || docker run -d --name gitea -p 3000:3000 gitea/gitea:1.21.1
+      - name: Go workspace (as the Dagger module's)
+        run: &gowork |
+          printf 'go 1.27.0\n\nuse (\n\t.\n\t./build\n\t./core\n\t./errors\n\t./rpc/flipt\n\t./rpc/v2/environments\n\t./rpc/v2/evaluation\n\t./sdk/go\n\t./sdk/go/v2\n)\n' > go.work
+          go work sync
+          go mod download
+      - name: Run Unit Tests
+        run: &unit |
+          push=$(go run ./build/internal/cmd/gitea/... -gitea-url http://localhost:3000 -testdata-dir ./internal/storage/fs/git/testdata)
+          export REDIS_HOST=localhost:6379 TEST_GIT_REPO_URL=http://localhost:3000/root/features.git
+          export TEST_GIT_REPO_HEAD=$(jq -r .HEAD <<<"$push") TEST_GIT_REPO_TAG=$(jq -r .TAG <<<"$push")
+          go test -race -coverprofile=coverage.txt -covermode=atomic -coverpkg=./... ./...
+
+  unit-gha-engine:
+    name: Tests (Go) gha-engine
+    runs-on: outrun-linux-arm64
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - name: "outrun: start"
+        id: start
+        run: echo "at=$(date +%s)" >> "$GITHUB_OUTPUT"
+      - name: "outrun: Bun"
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.4
+      - name: "outrun: look unit up"
+        id: look
+        run: .github/outrun/run lookup unit
+      - uses: actions/setup-go@v6
+        if: steps.look.outputs.run == 'true'
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: actions/cache@v4
+        if: steps.look.outputs.run == 'true'
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-unit-engine-${{ env.NS }}-${{ github.run_id }}
+          restore-keys: go-unit-engine-${{ env.NS }}-
+      - name: Services (Redis, Gitea)
+        if: steps.look.outputs.run == 'true'
+        run: *services
+      - name: Go workspace (as the Dagger module's)
+        if: steps.look.outputs.run == 'true'
+        run: *gowork
+      - name: Run Unit Tests
+        if: steps.look.outputs.run == 'true'
+        run: *unit
+      - name: "outrun: record unit"
+        if: success() && steps.look.outputs.run == 'true'
+        run: .github/outrun/run record unit --key "${{ steps.look.outputs.key }}" --since ${{ steps.start.outputs.at }}
+
+  # ---- Build: integration-test.yml's `dagger call build` (the Flipt image, UI included), without the
+  # registry push (as a fork's pull request runs it) ----
+  build-dagger:
+    name: Build dagger
+    runs-on: outrun-linux-arm64
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - name: Start the Dagger engine
+        run: *engine
+      - name: Build
+        uses: dagger/dagger-for-github@v7
+        with:
+          verb: call
+          version: ${{ env.DAGGER_VERSION }}
+          args: build --source . sync
+
+  build-dagger-warm:
+    name: Build dagger-warm
+    runs-on: outrun-linux-arm64
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - name: Restore the engine's state
+        id: state
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/dagger-state.tzst
+          key: dagger-build-${{ env.NS }}-${{ github.run_id }}
+          restore-keys: dagger-build-${{ env.NS }}-
+      - name: Unpack the engine's state
+        if: steps.state.outputs.cache-matched-key != ''
+        run: *unpack
+      - name: Start the Dagger engine
+        run: *engine
+      - name: Build
+        uses: dagger/dagger-for-github@v7
+        with:
+          verb: call
+          version: ${{ env.DAGGER_VERSION }}
+          args: build --source . sync
+      - name: Pack the engine's state
+        run: *pack
+      - name: Save the engine's state
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/dagger-state.tzst
+          key: dagger-build-${{ env.NS }}-${{ github.run_id }}
+
+  build-gha:
+    name: Build gha
+    runs-on: outrun-linux-arm64
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+            ~/.npm
+          key: build-${{ env.NS }}-${{ github.run_id }}
+          restore-keys: build-${{ env.NS }}-
+      - name: Go workspace (as the Dagger module's)
+        run: *gowork
+      - name: Build
+        run: &build |
+          (cd ui && npm ci --no-audit --no-fund && npm run build)
+          go build -cover -coverpkg=./... -trimpath -tags assets,netgo -o bin/flipt \
+            -ldflags "-s -w -X main.date=$(date -u +%FT%TZ) -X main.commit=$(git rev-parse HEAD)" ./cmd/flipt
+          ls -l bin/flipt
+
+  build-gha-engine:
+    name: Build gha-engine
+    runs-on: outrun-linux-arm64
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - name: "outrun: start"
+        id: start
+        run: echo "at=$(date +%s)" >> "$GITHUB_OUTPUT"
+      - name: "outrun: Bun"
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.4
+      - name: "outrun: look build up"
+        id: look
+        run: .github/outrun/run lookup build
+      - uses: actions/setup-go@v6
+        if: steps.look.outputs.run == 'true'
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: actions/setup-node@v5
+        if: steps.look.outputs.run == 'true'
+        with:
+          node-version: 24
+      - uses: actions/cache@v4
+        if: steps.look.outputs.run == 'true'
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+            ~/.npm
+          key: build-engine-${{ env.NS }}-${{ github.run_id }}
+          restore-keys: build-engine-${{ env.NS }}-
+      - name: Go workspace (as the Dagger module's)
+        if: steps.look.outputs.run == 'true'
+        run: *gowork
+      - name: Build
+        if: steps.look.outputs.run == 'true'
+        run: *build
+      - name: "outrun: record build"
+        if: success() && steps.look.outputs.run == 'true'
+        run: .github/outrun/run record build --key "${{ steps.look.outputs.key }}" --since ${{ steps.start.outputs.at }}
