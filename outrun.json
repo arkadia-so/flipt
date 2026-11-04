@@ -1,0 +1,30 @@
+{
+  "inputs": [
+    "go.mod",
+    "go.sum",
+    "**/go.mod",
+    "**/go.sum",
+    "ui/package.json",
+    "ui/package-lock.json",
+    ".github/workflows/bench-s9.yml"
+  ],
+  "env": [],
+  "suites": [],
+  "trustedRef": "refs/heads/bench/engine",
+  "commands": [
+    {
+      "name": "unit",
+      "run": "go test -race -coverpkg=./... ./... (Redis and Gitea in Docker)",
+      "inputs": [
+        "**/*"
+      ]
+    },
+    {
+      "name": "build",
+      "run": "UI (npm ci, vite build), then go build -cover -tags assets,netgo ./cmd/flipt",
+      "inputs": [
+        "**/*"
+      ]
+    }
+  ]
+}
